@@ -8,5 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.69"
 async-trait = "0.1.64"
+csv = "1.2.1"
 hyper = {version = "0.14.24", features = ["full"]}
+serde = {version = "1.0.160", features = ["derive"]}
 tokio = {version = "1.25.0", features = ["full"]}

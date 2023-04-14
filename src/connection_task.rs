@@ -2,8 +2,9 @@ use anyhow::{Context, Ok, Result};
 use async_trait::async_trait;
 use hyper::{client::HttpConnector, http::Uri, Body, Client, StatusCode};
 use tokio::sync::mpsc::{UnboundedSender};
-use std::{time::{Duration, Instant}};
+use std::{time::{Duration, Instant}, collections::HashMap};
 use super::notification::NotificationTask;
+use serde::{Serialize, Deserialize};
 
 type HTTPClient = Client<HttpConnector, Body>;
 
@@ -44,64 +45,151 @@ impl TaskProps {
     }
 }
 
-#[derive(Debug)]
-pub struct ConnectionStats {
-    pub connection_id: u64,
-    pub requests_executed: u64,
-    pub requests_succeded: u64,
-    pub requests_failed: u64,
-    pub duration: Duration,
+#[derive(Serialize, Deserialize)]
+pub struct Statistics {
+    pub code: u16,
+    pub requests: u64,
+    pub max: f64,
+    pub min: f64,
+    pub mean: f64,
+    pub sd: f64,
+    pub p90: f64,
+    pub p99: f64
 }
 
-#[derive(Debug)]
-pub struct TaskResults {
-    pub stats_summaries: Vec<ConnectionStats>,
-    pub total_duration_ms: u64,
+impl Statistics {
+
+    fn new(code: u16, requests: u64, max: f64, min: f64, mean: f64, sd: f64, p90: f64, p99: f64) -> Self {
+        Statistics { code, requests, max, min, mean, sd, p90, p99 }
+    }
 }
 
-impl ConnectionStats {
-    pub fn new() -> Self {
-        ConnectionStats {
-            connection_id: 0,
-            requests_executed: 0,
-            requests_succeded: 0,
-            requests_failed: 0,
-            duration: Duration::ZERO,
+#[derive(Debug, Eq, PartialOrd, Clone)]
+pub struct RequestMetrics {
+    pub latency: Duration,
+    pub status_code: u16
+}
+
+impl std::cmp::Ord for RequestMetrics {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.latency.cmp(&other.latency)
+    }
+}
+
+impl PartialEq for RequestMetrics {
+    fn eq(&self, other: &Self) -> bool {
+        self.latency == other.latency
+    }
+}
+
+pub struct Report {
+    requests_metrics: Vec<RequestMetrics>,
+    elapsed: Duration
+}
+
+impl Report {
+
+    pub fn get_requests_count(&self) -> usize {
+        self.requests_metrics.len()
+    }
+
+    pub fn get_successful_requests(&self) -> usize {
+        self.requests_metrics.iter().filter(|&req| req.status_code >= 200 && req.status_code <= 418).collect::<Vec<&RequestMetrics>>().len()
+    }
+
+    pub fn get_failed_requests(&self) -> usize {
+        self.requests_metrics.iter().filter(|&req| req.status_code > 418).collect::<Vec<&RequestMetrics>>().len()
+    }
+
+    pub fn get_elapsed(&self) -> Duration {
+        self.elapsed
+    }
+
+    pub fn get_stats(&self) -> Vec<Statistics> {
+        let mut map: HashMap<u16, Vec<RequestMetrics>> = HashMap::new();
+
+        for req in self.requests_metrics.iter() {
+            if map.contains_key(&req.status_code) {
+                if let Some(data) = map.get_mut(&req.status_code) {
+                    data.push(req.clone());
+                }
+            } else {
+                map.insert(req.status_code, vec![req.clone()]);
+            }
         }
+
+        let mut statistics = Vec::with_capacity(map.keys().len());
+
+        for (code, metrics) in &map {
+            let mut values = metrics.iter().map(|x| x.latency.as_secs_f64()).collect::<Vec<f64>>();
+            let max_ms = calc_max(values.clone()) * 1_000_000_f64;
+            let min_ms = calc_min(values.clone()) * 1_000_000_f64;
+            let mean = calc_mean(&values);
+            let mean_ms = mean * 1_000_000_f64;
+            let sd_ms = calc_sd(&mean, &values) * 1_000_000_f64;
+            let p90 = calc_px(0.9, &mut values) * 1_000_000_f64;
+            let p99 = calc_px(0.99, &mut values) * 1_000_000_f64;
+
+            statistics.push(Statistics::new(code.clone(), metrics.len() as u64, max_ms, min_ms, mean_ms, sd_ms, p90, p99));
+        }
+
+        statistics
     }
 
-    pub fn add(&mut self, stats: ConnectionStats) {
-        self.requests_executed += stats.requests_executed;
-        self.requests_succeded += stats.requests_succeded;
-        self.requests_failed += stats.requests_failed;
-        self.duration += stats.duration;
+    pub fn save_to_file(&self, file_name: String) -> Result<(), anyhow::Error> {
+        let path = std::path::Path::new(&file_name);
+        let mut wtr = csv::Writer::from_path(path)?;
+        for stat in self.get_stats().iter() {
+            wtr.serialize(stat)?;
+        }
+        wtr.flush()?;
+        Ok(())
     }
 
-    pub fn output_report(&self) {
-        println!(
-            "Total: {} Success: {} Failed: {} Elapsed: {} ms Rate: {} req/s",
-            self.requests_executed,
-            self.requests_succeded,
-            self.requests_failed,
-            self.duration.as_millis(),
-            self.requests_executed * 1000 / self.duration.as_millis() as u64
-        );
+}
+
+fn calc_min(values: Vec<f64>) -> f64 {
+    match values.into_iter().reduce(f64::min) {
+        Some(x) => x,
+        None => 0.0
     }
+}
+
+fn calc_max(values: Vec<f64>) -> f64 {
+    match values.into_iter().reduce(f64::max) {
+        Some(x) => x,
+        None => 0.0
+    }
+}
+
+fn calc_mean(values: &Vec<f64>) -> f64 {
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+fn calc_sd(mean: &f64, values: &Vec<f64>) -> f64 {
+    let sum = values.iter().map(|v| (v - mean).powf(2_f64)).sum::<f64>();
+    (sum / values.len() as f64).sqrt()
+}
+
+fn calc_px(percentile: f64, values: &mut Vec<f64>) -> f64 {
+    let p90_index = (values.len() as f64 * percentile).ceil() as usize;
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    values[p90_index - 1]
 }
 
 pub async fn task(
     connector: impl HTTPClientConformer,
     task_props: TaskProps,
-) -> Result<ConnectionStats, anyhow::Error> {
-    let mut connection_stats = ConnectionStats::new();
-    connection_stats.connection_id = task_props.task_id;
+) -> Result<Vec<RequestMetrics>, anyhow::Error> {
+    let mut metrics = Vec::with_capacity(task_props.num_of_requests as usize);
 
     for i in 0..task_props.num_of_requests {
         let now = Instant::now();
-        let status_code = connector.fetch(task_props.uri.clone()).await?;
-        let duration = now.elapsed();
-        connection_stats.requests_executed += 1;
-        connection_stats.duration += duration;
+        let status_code = connector.fetch(task_props.uri.clone()).await?.as_u16();
+        let latency = now.elapsed();
+        let request_metric = RequestMetrics { latency,  status_code };
+
+        metrics.push(request_metric);
 
         if i % 250 == 0 {
             let msg = NotificationTask {
@@ -113,27 +201,33 @@ pub async fn task(
                 let _ = sender.send(msg);
             }
         }
-
-        match status_code {
-            StatusCode::OK => connection_stats.requests_succeded += 1,
-            _ => connection_stats.requests_failed += 1,
-        }
     }
 
-    Ok(connection_stats)
+    Ok(metrics)
+
 }
 
-pub async fn run(settings: RunSettings, messenger: Option<UnboundedSender<NotificationTask>>) -> Result<TaskResults> {
-    let mut join_handles = Vec::new();
-    let mut task_results = Vec::new();
+pub async fn run(settings: RunSettings, messenger: Option<UnboundedSender<NotificationTask>>) -> Result<Report> {
+    let mut join_handles = Vec::with_capacity(settings.connections as usize);
+    let mut task_results = Vec::with_capacity(settings.connections as usize);
+    let mut request_overflow = settings.requests % settings.connections as u64;
     let now = Instant::now();
 
     for i in 0..settings.connections {
         let client = Client::builder().build_http::<Body>();
+
+        let addition: u64 = match request_overflow {
+            x if x >= 1 => {
+                request_overflow -= 1;
+                1
+            },
+            _ => 0
+        };
+
         let task_props = TaskProps::new(
             messenger.clone(),
             i as u64,
-            settings.requests / settings.connections as u64,
+            (settings.requests / settings.connections as u64) + addition,
             settings.target_url.clone(),
         );
 
@@ -147,24 +241,23 @@ pub async fn run(settings: RunSettings, messenger: Option<UnboundedSender<Notifi
         task_results.push(result);
     }
 
-    let completion = now.elapsed().as_millis() as u64;
+    let elapsed = now.elapsed();
 
-    let final_results = TaskResults {
-        stats_summaries: task_results,
-        total_duration_ms: completion,
-    };
+    let requests_metrics = task_results.into_iter().flatten().collect::<Vec<RequestMetrics>>();
 
-    Ok(final_results)
+    Ok(Report { requests_metrics, elapsed })
 
 }
 
 
 #[cfg(test)]
 mod test_connection {
+    use std::vec;
+    use tokio::time::Duration;
     use async_trait::async_trait;
     use hyper::{StatusCode, Uri};
     use crate::connection_task::TaskProps;
-    use super::{HTTPClientConformer, task};
+    use super::{HTTPClientConformer, Report, RequestMetrics, task, calc_min, calc_max, calc_mean, calc_sd, calc_px};
 
     struct MockClient {
         response_code: Option<StatusCode>
@@ -174,6 +267,66 @@ mod test_connection {
         fn response_with_code(response_code: Option<StatusCode>) -> Self {
             MockClient { response_code }
         }
+    }
+
+    #[test]
+    fn test_save_to_file() {
+        let report = Report {
+            requests_metrics: vec![
+                RequestMetrics { latency: Duration::from_micros(90) , status_code: 200 },
+                RequestMetrics { latency: Duration::from_micros(90) , status_code: 200 },
+                RequestMetrics { latency: Duration::from_micros(90) , status_code: 200 },
+                RequestMetrics { latency: Duration::from_micros(90) , status_code: 200 },
+                RequestMetrics { latency: Duration::from_micros(90) , status_code: 200 },
+                RequestMetrics { latency: Duration::from_micros(90) , status_code: 200 },
+                RequestMetrics { latency: Duration::from_micros(90) , status_code: 404 },
+                RequestMetrics { latency: Duration::from_micros(90) , status_code: 418 },
+                RequestMetrics { latency: Duration::from_micros(90) , status_code: 500 }
+            ],
+            elapsed: Duration::from_millis(5)
+        };
+
+        let file_name = String::from("test.csv");
+        let result = report.save_to_file(file_name);
+        assert_eq!(result.is_ok(), true);
+    }
+
+    #[test]
+    fn test_calc_min() {
+        let test_values: Vec<f64> = vec![6.0, 2.0, 3.0, 1.0];
+        let min = calc_min(test_values);
+        assert_eq!(min, 1.0);
+    }
+
+    #[test]
+    fn test_calc_max() {
+        let test_values: Vec<f64> = vec![6.0, 2.0, 3.0, 1.0];
+        let max = calc_max(test_values);
+        assert_eq!(max, 6.0);
+    }
+
+    #[test]
+    fn test_calc_mean() {
+        let test_values: Vec<f64> = vec![6.0, 2.0, 3.0, 1.0];
+        let mean = calc_mean(&test_values);
+        assert_eq!(mean, 3.0);
+    }
+
+    #[test]
+    fn test_calc_sd() {
+        let test_values: Vec<f64> = vec![6.0, 2.0, 3.0, 1.0];
+        let mean = calc_mean(&test_values);
+        let sd = calc_sd(&mean, &test_values);
+        assert_eq!(sd, 1.8708286933869707);
+    }
+
+    #[test]
+    fn test_calc_px() {
+        let mut test_values: Vec<f64> = vec![6.0, 2.0, 3.0, 1.0];
+        let p90 = calc_px(0.9, &mut test_values);
+        let p99 = calc_px(0.99, &mut test_values);
+        assert_eq!(p90, 6.0);
+        assert_eq!(p99, 6.0);
     }
 
     #[async_trait]
@@ -192,8 +345,8 @@ mod test_connection {
         let task_props = TaskProps::new(None, 0, 12, Uri::from_static("http://test.com/hello/world"));
         let result = task(client, task_props).await;
         let stats = result.expect("all requests should be successful with code 200");
-        assert_eq!(stats.requests_failed, 0);
-        assert_eq!(stats.requests_succeded, 12);
+        assert_eq!(stats.iter().filter(|x| x.status_code == 500).count(), 0);
+        assert_eq!(stats.iter().filter(|x| x.status_code <= 418).count(), 12);
     }
 
     #[tokio::test]
@@ -202,8 +355,8 @@ mod test_connection {
         let task_props = TaskProps::new(None, 0, 12, Uri::from_static("http://test.com/hello/world"));
         let result = task(client, task_props).await;
         let stats = result.expect("all requests should fail with code 500");
-        assert_eq!(stats.requests_failed, 12);
-        assert_eq!(stats.requests_succeded, 0);
+        assert_eq!(stats.iter().filter(|x| x.status_code == 500).count(), 12);
+        assert_eq!(stats.iter().filter(|x| x.status_code <= 418).count(), 0);
     }
 
     #[tokio::test]
